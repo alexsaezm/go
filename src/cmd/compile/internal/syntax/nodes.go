@@ -418,6 +418,14 @@ type (
 		stmt
 	}
 
+	UntilStmt struct {
+		Init SimpleStmt
+		Cond Expr
+		Post SimpleStmt
+		Body *BlockStmt
+		stmt
+	}
+
 	SwitchStmt struct {
 		Init   SimpleStmt
 		Tag    Expr // incl. *TypeSwitchGuard

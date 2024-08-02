@@ -51,6 +51,7 @@ const (
 	_Defer       // defer
 	_Else        // else
 	_Fallthrough // fallthrough
+	_Until       // until
 	_For         // for
 	_Func        // func
 	_Go          // go
