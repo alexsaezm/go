@@ -221,7 +221,8 @@ const (
 	DW_FORM_exprloc      = 0x18 // exprloc
 	DW_FORM_flag_present = 0x19 // flag
 	// Dwarf5
-	DW_FORM_addrx = 0x1b
+	DW_FORM_addrx     = 0x1b
+	DW_FORM_line_strp = 0x1f // offset into .debug_line_str
 	// Pseudo-form: expanded to data4 on IOS, udata elsewhere.
 	DW_FORM_udata_pseudo = 0x99
 	// Pseudo-form: expands to DW_FORM_addrx in DWARF5, DW_FORM_addr in DWARF4

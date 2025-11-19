@@ -67,6 +67,12 @@ type dwctxt struct {
 	// Used at various points in that parallel portion of DWARF gen to
 	// protect against conflicting updates to globals (such as "gdbscript")
 	dwmu *sync.Mutex
+
+	// String table for .debug_line_str (DWARF5 only)
+	lineStrTab map[string]uint32
+	lineStrSym loader.Sym
+	// Protect concurrent access during parallel CU processing
+	lineStrMutex sync.Mutex
 }
 
 // dwSym wraps a loader.Sym; this type is meant to obey the interface
@@ -98,6 +104,12 @@ func (c dwctxt) AddString(s dwarf.Sym, v string) {
 	ds := loader.Sym(s.(dwSym))
 	dsu := c.ldr.MakeSymbolUpdater(ds)
 	dsu.Addstring(v)
+}
+
+func (c dwctxt) AddUint32(s dwarf.Sym, v uint32) {
+	ds := loader.Sym(s.(dwSym))
+	dsu := c.ldr.MakeSymbolUpdater(ds)
+	dsu.AddUintXX(c.arch, uint64(v), 4)
 }
 
 func (c dwctxt) AddAddress(s dwarf.Sym, data any, value int64) {
@@ -157,6 +169,28 @@ func (c dwctxt) AddIndirectTextRef(s dwarf.Sym, t any) {
 
 func (c dwctxt) Logf(format string, args ...any) {
 	c.linkctxt.Logf(format, args...)
+}
+
+// addToLineStrTable adds a string to the .debug_line_str section and returns
+// its offset. Thread-safe for parallel CU processing. Deduplicates strings.
+func (d *dwctxt) addToLineStrTable(str string) uint32 {
+	d.lineStrMutex.Lock()
+	defer d.lineStrMutex.Unlock()
+
+	// Check if string already exists
+	if off, exists := d.lineStrTab[str]; exists {
+		return off
+	}
+
+	// Add new string to section
+	lsu := d.ldr.MakeSymbolUpdater(d.lineStrSym)
+	offset := uint32(lsu.Size())
+	lsu.Addstring(str)
+
+	// Record offset for future lookups
+	d.lineStrTab[str] = offset
+
+	return offset
 }
 
 // At the moment these interfaces are only used in the compiler.
@@ -1226,11 +1260,12 @@ func (d *dwctxt) writeDirFileTables(unit *sym.CompilationUnit, lsu *loader.Symbo
 		lsu.AddUint8(1) // directory_entry_format_count
 		// each directory entry is just a single path string.
 		dwarf.Uleb128put(d, lsDwsym, dwarf.DW_LNCT_path)
-		dwarf.Uleb128put(d, lsDwsym, dwarf.DW_FORM_string)
+		dwarf.Uleb128put(d, lsDwsym, dwarf.DW_FORM_line_strp)
 		// emit count, then dirs
 		dwarf.Uleb128put(d, lsDwsym, int64(len(dirs)))
 		for k := 0; k < len(dirs); k++ {
-			d.AddString(lsDwsym, dirs[k])
+			offset := d.addToLineStrTable(dirs[k])
+			d.AddUint32(lsDwsym, offset)
 		}
 
 		// ... now file table.  With DWARF version 5 we put out a
@@ -1240,13 +1275,14 @@ func (d *dwctxt) writeDirFileTables(unit *sym.CompilationUnit, lsu *loader.Symbo
 		lsu.AddUint8(2) // file_entry_format_count
 		// each file entry is just a file path followed by dir index.
 		dwarf.Uleb128put(d, lsDwsym, dwarf.DW_LNCT_path)
-		dwarf.Uleb128put(d, lsDwsym, dwarf.DW_FORM_string)
+		dwarf.Uleb128put(d, lsDwsym, dwarf.DW_FORM_line_strp)
 		dwarf.Uleb128put(d, lsDwsym, dwarf.DW_LNCT_directory_index)
 		dwarf.Uleb128put(d, lsDwsym, dwarf.DW_FORM_udata)
 		// emit count, then files
 		dwarf.Uleb128put(d, lsDwsym, int64(len(files)))
 		for k := 0; k < len(files); k++ {
-			d.AddString(lsDwsym, files[k].base)
+			offset := d.addToLineStrTable(files[k].base)
+			d.AddUint32(lsDwsym, offset)
 			dwarf.Uleb128put(d, lsDwsym, int64(files[k].dir))
 		}
 	} else {
@@ -2227,17 +2263,26 @@ func (d *dwctxt) dwarfGenerateDebugSyms() {
 		locSym = mkSecSym(".debug_loc")
 	}
 	infoSym := mkSecSym(".debug_info")
-	var addrSym loader.Sym
+	var addrSym, lineStrSym loader.Sym
 	if buildcfg.Experiment.Dwarf5 {
 		addrSym = mkSecSym(".debug_addr")
+		lineStrSym = mkSecSym(".debug_line_str")
+		// Create and assign section for .debug_line_str
+		lineStrSect := d.ldr.NewSection()
+		lineStrSect.Name = ".debug_line_str"
+		lineStrSect.Seg = &Segdwarf
+		d.ldr.SetSymSect(lineStrSym, lineStrSect)
+		d.lineStrSym = lineStrSym
+		d.lineStrTab = make(map[string]uint32)
 	}
 
 	// Create the section objects
 	lineSec := dwarfSecInfo{syms: []loader.Sym{lineSym}}
 	frameSec := dwarfSecInfo{syms: []loader.Sym{frameSym}}
 	infoSec := dwarfSecInfo{syms: []loader.Sym{infoSym}}
-	var addrSec, rangesSec, locSec dwarfSecInfo
+	var addrSec, rangesSec, locSec, lineStrSec dwarfSecInfo
 	if buildcfg.Experiment.Dwarf5 {
+		lineStrSec = dwarfSecInfo{syms: []loader.Sym{lineStrSym}}
 		addrHdr := d.writeDebugAddrHdr()
 		addrSec.syms = []loader.Sym{addrSym, addrHdr}
 		rnglistsHdr := d.writeDebugRngListsHdr()
@@ -2358,6 +2403,7 @@ func (d *dwctxt) dwarfGenerateDebugSyms() {
 	dwarfp = append(dwarfp, rangesSec)
 	if buildcfg.Experiment.Dwarf5 {
 		dwarfp = append(dwarfp, addrSec)
+		dwarfp = append(dwarfp, lineStrSec)
 	}
 
 	// Check to make sure we haven't listed any symbols more than once
@@ -2403,7 +2449,7 @@ func dwarfaddshstrings(ctxt *Link, add func(string)) {
 
 	secs := []string{"abbrev", "frame", "info", "loc", "line", "gdb_scripts"}
 	if buildcfg.Experiment.Dwarf5 {
-		secs = append(secs, "addr", "rnglists", "loclists")
+		secs = append(secs, "addr", "rnglists", "loclists", "line_str")
 	} else {
 		secs = append(secs, "ranges", "loc")
 	}
